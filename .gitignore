@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.playwright-cli/
+output/
+
+# Local trade data and private exports
+fund_data/*.csv
+fund_data/*.db
+fund_data/*backup*.csv
+data.xlsx
+cleaned_data_preview.csv
+missing_records.csv

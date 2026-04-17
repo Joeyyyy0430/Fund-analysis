@@ -1,0 +1,10 @@
+streamlit
+pandas
+requests
+pillow
+altair
+pytesseract
+lxml
+html5lib
+openpyxl
+pdfplumber
