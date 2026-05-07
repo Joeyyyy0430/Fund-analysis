@@ -39,13 +39,39 @@ CANONICAL_NAME_MAP = {
 BUY_TYPES = {"用户买入", "定投买入"}
 SELL_TYPES = {"用户卖出"}
 
+COLUMN_ALIASES = {
+    "order_id": ["订单号", "交易单号", "流水号"],
+    "tx_datetime": ["确认时间", "确认日期", "交易时间", "申请时间", "创建时间"],
+    "raw_type": ["交易类型", "业务类型"],
+    "name": ["基金名称", "产品名称", "资产名称"],
+    "code": ["基金代码", "产品代码", "资产代码"],
+    "apply_amount": ["申请金额", "申请金额(元)", "交易金额"],
+    "apply_shares": ["申请份额", "申请份额(份)"],
+    "confirm_amount": ["确认金额", "确认金额(元)", "成交金额"],
+    "confirm_shares": ["确认份额", "确认份额(份)", "成交份额"],
+    "fee": ["手续费", "交易费用", "费用"],
+}
+
+FALLBACK_COLUMNS = {
+    "order_id": 0,
+    "tx_datetime": 1,
+    "raw_type": 2,
+    "name": 3,
+    "code": 5,
+    "apply_amount": 6,
+    "apply_shares": 7,
+    "confirm_amount": 8,
+    "confirm_shares": 9,
+    "fee": 10,
+}
+
 
 def clean_text(value):
     return (value or "").replace("\n", "").replace(",", "").strip()
 
 
 def parse_decimal(value):
-    text = clean_text(value)
+    text = clean_text(value).replace("元", "").replace("份", "").replace("%", "")
     if not text or text == "/":
         return None
     try:
@@ -55,14 +81,18 @@ def parse_decimal(value):
 
 
 def parse_datetime(value):
-    text = clean_text(value)
-    if not text:
+    raw_text = str(value or "").replace(",", "").strip()
+    compact_text = clean_text(value)
+    spaced_text = re.sub(r"\s+", " ", raw_text.replace("\n", " ")).strip()
+    candidates = [text for text in (spaced_text, compact_text) if text]
+    if not candidates:
         return None
-    for fmt in ("%Y/%m/%d %H:%M", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            continue
+    for text in candidates:
+        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
     return None
 
 
@@ -79,6 +109,100 @@ def backup_existing_file(path):
 def normalize_name(code, raw_name):
     canonical = CANONICAL_NAME_MAP.get(code)
     return canonical or raw_name
+
+
+def normalize_header(value):
+    text = clean_text(value)
+    text = text.replace("（", "(").replace("）", ")")
+    return re.sub(r"\s+", "", text)
+
+
+def detect_column_map(row, previous_map):
+    headers = [normalize_header(cell) for cell in row]
+    if not any("交易类型" in header or "业务类型" in header for header in headers):
+        return previous_map
+
+    column_map = {}
+    for field, aliases in COLUMN_ALIASES.items():
+        normalized_aliases = [normalize_header(alias) for alias in aliases]
+        for alias in normalized_aliases:
+            for index, header in enumerate(headers):
+                if alias and alias in header:
+                    column_map[field] = index
+                    break
+            if field in column_map:
+                break
+    return column_map or previous_map
+
+
+def row_value(row, column_map, field):
+    index = column_map.get(field, FALLBACK_COLUMNS.get(field))
+    if index is None or index >= len(row):
+        return ""
+    return row[index]
+
+
+def extract_code(row, column_map):
+    raw_code = clean_text(row_value(row, column_map, "code"))
+    match = re.search(r"(?<!\d)(\d{6})(?!\d)", raw_code)
+    if match:
+        return match.group(1)
+
+    for cell in row:
+        text = clean_text(cell)
+        if text.isdigit() and len(text) == 6:
+            return text
+    return ""
+
+
+def extract_name(row, column_map, code):
+    name = clean_text(row_value(row, column_map, "name"))
+    code_index = column_map.get("code", FALLBACK_COLUMNS.get("code"))
+    if (not name or name == code) and code_index and code_index < len(row):
+        previous_index = code_index - 1
+        if previous_index >= 0:
+            name = clean_text(row[previous_index])
+    return name
+
+
+def extract_transaction_row(row, column_map, seq, page_number, row_index):
+    raw_type = clean_text(row_value(row, column_map, "raw_type"))
+    if not raw_type or raw_type == "交易类型":
+        return None
+
+    code = extract_code(row, column_map)
+    if not (code.isdigit() and len(code) == 6):
+        return None
+
+    name = extract_name(row, column_map, code)
+    if any(keyword in name for keyword in EXCLUDE_KEYWORDS):
+        return None
+
+    tx_datetime = parse_datetime(row_value(row, column_map, "tx_datetime"))
+    confirm_amount = parse_decimal(row_value(row, column_map, "confirm_amount"))
+    confirm_shares = parse_decimal(row_value(row, column_map, "confirm_shares"))
+    if confirm_amount is None:
+        confirm_amount = parse_decimal(row_value(row, column_map, "apply_amount"))
+    if confirm_shares is None:
+        confirm_shares = parse_decimal(row_value(row, column_map, "apply_shares"))
+    if tx_datetime is None or confirm_amount is None or confirm_shares is None:
+        return None
+
+    return {
+        "seq": seq,
+        "page_number": page_number,
+        "row_index": row_index,
+        "order_id": clean_text(row_value(row, column_map, "order_id")),
+        "tx_datetime": tx_datetime,
+        "raw_type": raw_type,
+        "code": code,
+        "name": normalize_name(code, name),
+        "apply_amount": parse_decimal(row_value(row, column_map, "apply_amount")),
+        "apply_shares": parse_decimal(row_value(row, column_map, "apply_shares")),
+        "confirm_amount": confirm_amount,
+        "confirm_shares": confirm_shares,
+        "fee": parse_decimal(row_value(row, column_map, "fee")) or Decimal("0"),
+    }
 
 
 def parse_pdf_metadata(pdf_file):
@@ -101,45 +225,17 @@ def extract_rows(pdf_file):
         seq = 0
         for page_number, page in enumerate(pdf.pages, start=1):
             for table in page.extract_tables():
+                column_map = dict(FALLBACK_COLUMNS)
                 for row_index, row in enumerate(table):
-                    if not row or len(row) < 10:
+                    if not row:
                         continue
 
-                    raw_type = clean_text(row[2])
-                    if not raw_type or raw_type == "交易类型":
+                    column_map = detect_column_map(row, column_map)
+                    parsed_row = extract_transaction_row(row, column_map, seq, page_number, row_index)
+                    if parsed_row is None:
                         continue
 
-                    code = clean_text(row[5])
-                    if not (code.isdigit() and len(code) == 6):
-                        continue
-
-                    name = clean_text(row[3])
-                    if any(keyword in name for keyword in EXCLUDE_KEYWORDS):
-                        continue
-
-                    tx_datetime = parse_datetime(row[1])
-                    confirm_amount = parse_decimal(row[8])
-                    confirm_shares = parse_decimal(row[9])
-                    if tx_datetime is None or confirm_amount is None or confirm_shares is None:
-                        continue
-
-                    rows.append(
-                        {
-                            "seq": seq,
-                            "page_number": page_number,
-                            "row_index": row_index,
-                            "order_id": clean_text(row[0]),
-                            "tx_datetime": tx_datetime,
-                            "raw_type": raw_type,
-                            "code": code,
-                            "name": normalize_name(code, name),
-                            "apply_amount": parse_decimal(row[6]),
-                            "apply_shares": parse_decimal(row[7]),
-                            "confirm_amount": confirm_amount,
-                            "confirm_shares": confirm_shares,
-                            "fee": parse_decimal(row[10]) or Decimal("0"),
-                        }
-                    )
+                    rows.append(parsed_row)
                     seq += 1
     return rows
 
@@ -170,8 +266,8 @@ def build_transactions(rows):
         if tx_type is None:
             continue
 
-        amount = row["confirm_amount"]
-        shares = row["confirm_shares"]
+        amount = abs(row["confirm_amount"])
+        shares = abs(row["confirm_shares"])
         nav = (amount / shares) if shares > 0 else Decimal("0")
         trade_time = row["tx_datetime"].strftime("%Y-%m-%dT%H:%M:%S")
         external_id = row["order_id"] or f"pdf-row-{row['seq']}"

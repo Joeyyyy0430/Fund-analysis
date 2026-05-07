@@ -53,8 +53,30 @@ CATEGORY_LABELS = {
     "ENERGY": "新能源",
     "GROWTH": "成长主题",
     "GLOBAL": "全球市场",
+    "ACTIVE EQUITY": "主动权益",
+    "HEALTH & CONSUMER": "医药消费",
+    "FINANCE": "金融地产",
+    "BROAD MARKET": "宽基指数",
+    "CASH & BOND": "债券货币",
+    "UNCATEGORIZED": "未分类",
     "OTHER": "其他",
 }
+
+INFERRED_META_RULES = [
+    (("黄金", "贵金属"), "GOLD & PRECIOUS", "GOLD"),
+    (("纳斯达克", "标普", "QDII", "全球", "海外", "恒生", "港股", "港股通"), "GLOBAL", "MARKET"),
+    (("半导体", "芯片", "集成电路"), "AI & DATA", "SEMI"),
+    (("人工智能", "云计算", "大数据", "算力", "软件", "通信"), "AI & DATA", "AI"),
+    (("有色", "资源", "煤炭", "钢铁", "化工", "油气", "稀土", "金属"), "RESOURCES", "RESOURCE"),
+    (("军工", "航天", "航空", "卫星", "国防"), "MILITARY", "MILITARY"),
+    (("新能源", "光伏", "储能", "电池", "电网", "低碳", "环保"), "ENERGY", "NEW_ENERGY"),
+    (("医药", "医疗", "生物", "创新药", "健康"), "HEALTH & CONSUMER", "HEALTH"),
+    (("消费", "白酒", "食品", "农业", "家电"), "HEALTH & CONSUMER", "CONSUMER"),
+    (("银行", "证券", "金融", "地产", "房地产", "保险"), "FINANCE", "FINANCE"),
+    (("债", "货币", "现金", "短融", "同业存单"), "CASH & BOND", "NONE"),
+    (("沪深300", "中证500", "中证1000", "创业板", "科创", "上证", "红利"), "BROAD MARKET", "MARKET"),
+    (("混合", "股票", "成长", "价值", "优势", "趋势", "精选", "产业", "行业"), "ACTIVE EQUITY", "MARKET"),
+]
 
 TERM_TIPS = {
     "持仓市值": "按当前盘中估算净值或最新可得净值计算出来的持仓总价值。",
@@ -80,6 +102,43 @@ def load_transactions():
     except Exception as e:
         st.error(f"Error loading transactions: {e}")
         return []
+
+
+def normalize_fund_name(name, code=""):
+    text = re.sub(r"\s+", " ", str(name or "").replace("\n", " ")).strip()
+    invalid_names = {"", "nan", "none", "null", "unknown"}
+    if text.lower() in invalid_names or text.startswith("Unknown("):
+        return f"未知基金({code})" if code else "未知基金"
+    return text
+
+
+def build_fund_name_lookup(transactions):
+    names = {}
+    for tx in transactions:
+        code = str(tx.get("code") or "").strip()
+        if not code:
+            continue
+        name = normalize_fund_name(tx.get("name"), code)
+        if not name.startswith("未知基金("):
+            names[code] = name
+    return names
+
+
+def infer_fund_group(name):
+    compact_name = re.sub(r"\s+", "", name or "")
+    for keywords, category, bench in INFERRED_META_RULES:
+        if any(keyword in compact_name for keyword in keywords):
+            return category, bench
+    return "UNCATEGORIZED", "MARKET"
+
+
+def resolve_fund_meta(code, name_lookup):
+    if code in FUND_META:
+        return dict(FUND_META[code])
+
+    display_name = normalize_fund_name(name_lookup.get(code), code)
+    category, bench = infer_fund_group(display_name)
+    return {"name": display_name, "category": category, "bench": bench}
 
 def get_portfolio_from_transactions(transactions):
     """Calculate current holdings from transaction history."""
@@ -401,13 +460,14 @@ def sync_uploaded_pdf(uploaded_file, snapshot=False):
 # Initial Load
 TRANS_HISTORY = load_transactions()
 HOLDINGS_STATE = get_portfolio_from_transactions(TRANS_HISTORY)
+FUND_NAME_LOOKUP = build_fund_name_lookup(TRANS_HISTORY)
 
 # Construct Display Portfolio
 MY_PORTFOLIO = {}
 for code, data in HOLDINGS_STATE.items():
     if data['shares'] <= 0.001: continue # Skip empty positions (or handled purely as history?)
     
-    meta = FUND_META.get(code, {"name": f"Unknown({code})", "category": "OTHER", "bench": "NONE"})
+    meta = resolve_fund_meta(code, FUND_NAME_LOOKUP)
     cat = meta['category']
     if cat not in MY_PORTFOLIO: MY_PORTFOLIO[cat] = []
     
@@ -439,6 +499,9 @@ BENCHMARK_MAP = {
     "MILITARY": ("512660", "军工ETF"),
     "NEW_ENERGY": ("516160", "新能源ETF"),
     "MARKET": ("510300", "沪深300ETF"),
+    "HEALTH": ("512010", "医药ETF"),
+    "CONSUMER": ("510150", "消费ETF"),
+    "FINANCE": ("512800", "银行ETF"),
     "GOLD": ("518880", "黄金ETF"), 
     "STOCK": ("", "个股直连"),     
     "NONE": ("", "暂无数据")
@@ -1037,6 +1100,9 @@ st.markdown("""
         padding-top: 2.2rem;
         padding-bottom: 3rem;
     }
+    [data-testid="stSidebarUserContent"] {
+        padding-top: 2.4rem;
+    }
     .sidebar-title {
         font-family: 'SF Mono', monospace;
         font-size: 15px;
@@ -1049,7 +1115,7 @@ st.markdown("""
     }
     .sidebar-divider {
         height: 1px;
-        margin: 14px 0 18px;
+        margin: 18px 0 18px;
         background: linear-gradient(90deg, rgba(0, 242, 234, 0.2), rgba(255,255,255,0.04) 55%, transparent);
     }
     .sidebar-section-label {
@@ -1057,28 +1123,44 @@ st.markdown("""
         font-size: 10px;
         color: var(--text-3);
         letter-spacing: 1.8px;
-        margin: 0 0 10px 4px;
+        margin: 0 0 8px 4px;
         text-transform: uppercase;
     }
     
     /* 按钮重置 */
-    .stButton button { background: transparent !important; border: none !important; box-shadow: none !important; color: #666 !important; transition: all 0.2s !important; }
+    .stButton button {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: #666 !important;
+        transition: all 0.2s !important;
+        white-space: nowrap !important;
+    }
     .stButton button:hover { color: #fff !important; }
     .stButton button:focus { box-shadow: none !important; }
     
-    /* 刷新按钮 */
+    /* Sidebar tool buttons */
     div[data-testid="stSidebarUserContent"] button[kind="primary"] {
-        border: 1px solid #333 !important;
+        min-height: 40px !important;
+        border: 1px solid rgba(0, 242, 234, 0.24) !important;
         color: var(--accent) !important;
         font-family: 'SF Mono', monospace;
-        letter-spacing: 1px;
-        margin-top: 15px !important;
-        padding: 8px 0 !important;
-        border-radius: 999px !important;
+        font-size: 12px !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.6px !important;
+        margin-top: 0 !important;
+        padding: 0 12px !important;
+        border-radius: 12px !important;
+        background: linear-gradient(180deg, rgba(0, 242, 234, 0.08), rgba(0, 242, 234, 0.025)) !important;
     }
     div[data-testid="stSidebarUserContent"] button[kind="primary"]:hover {
-        border-color: var(--accent) !important;
+        border-color: rgba(0, 242, 234, 0.46) !important;
         background-color: var(--accent-soft) !important;
+    }
+    div[data-testid="stSidebarUserContent"] button[kind="primary"]:disabled {
+        border-color: var(--line-1) !important;
+        color: var(--text-3) !important;
+        background: rgba(255,255,255,0.015) !important;
     }
     
     /* 卡片样式 */
@@ -1301,6 +1383,56 @@ st.markdown("""
         border-radius: 999px !important;
         min-height: 36px !important;
     }
+    [data-testid="stSidebarUserContent"] [data-testid="stSegmentedControl"] {
+        width: 100%;
+        margin-bottom: 18px;
+        --primary-color: var(--accent);
+        --primary-color-light: rgba(0, 242, 234, 0.12);
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stSegmentedControl"] > div {
+        width: 100%;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+        padding: 4px;
+        border: 1px solid var(--line-1);
+        border-radius: 16px;
+        background: rgba(255,255,255,0.018);
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stSegmentedControl"] button {
+        width: 100% !important;
+        min-height: 40px !important;
+        border-radius: 12px !important;
+        padding: 0 10px !important;
+        justify-content: center !important;
+        color: var(--text-2) !important;
+        font-size: 13px !important;
+        font-weight: 600 !important;
+        line-height: 1 !important;
+        letter-spacing: 0 !important;
+        white-space: nowrap !important;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stSegmentedControl"] button p {
+        margin: 0 !important;
+        white-space: nowrap !important;
+        line-height: 1 !important;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stSegmentedControl"] button[aria-pressed="true"],
+    [data-testid="stSidebarUserContent"] [data-testid="stSegmentedControl"] button[kind="segmented_controlActive"] {
+        color: var(--text-1) !important;
+        border-color: rgba(0, 242, 234, 0.34) !important;
+        background: linear-gradient(180deg, rgba(0, 242, 234, 0.16), rgba(0, 242, 234, 0.055)) !important;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.05) !important;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stSegmentedControl"] button[aria-pressed="true"] *,
+    [data-testid="stSidebarUserContent"] [data-testid="stSegmentedControl"] button[kind="segmented_controlActive"] * {
+        color: var(--text-1) !important;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stSegmentedControl"] button:hover {
+        color: var(--text-1) !important;
+        border-color: rgba(0, 242, 234, 0.26) !important;
+        background: rgba(255,255,255,0.035) !important;
+    }
     .stSelectbox label, .stDateInput label, .stNumberInput label {
         font-family: 'SF Mono', monospace;
         font-size: 10px !important;
@@ -1313,6 +1445,48 @@ st.markdown("""
         letter-spacing: 1.8px;
         color: var(--text-3) !important;
     }
+    [data-testid="stSidebarUserContent"] [data-testid="stCheckbox"] {
+        margin: 8px 0 2px;
+        min-height: 30px;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stCheckbox"] label {
+        min-height: 30px;
+        padding: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        gap: 10px !important;
+        cursor: pointer;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stCheckbox"] label > div:first-child {
+        margin: 0 !important;
+        flex: 0 0 auto;
+        align-self: center !important;
+        transform: translateY(0) !important;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stCheckbox"] label > div:last-child {
+        display: flex !important;
+        align-items: center !important;
+        min-height: 30px !important;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stCheckbox"] p {
+        color: var(--text-2) !important;
+        font-size: 12px !important;
+        font-weight: 500 !important;
+        line-height: 18px !important;
+        margin: 0 !important;
+        white-space: nowrap !important;
+        display: inline-flex !important;
+        align-items: center !important;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stCheckbox"] [data-testid="stTooltipHoverTarget"] {
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        vertical-align: middle !important;
+        margin-left: 4px !important;
+        height: 18px !important;
+        line-height: 18px !important;
+    }
     [data-testid="stSidebarUserContent"] .stToggle p,
     [data-testid="stSidebarUserContent"] .stFileUploader label p {
         white-space: nowrap;
@@ -1320,42 +1494,47 @@ st.markdown("""
     [data-testid="stSidebarUserContent"] [data-testid="stExpander"] details {
         background: linear-gradient(180deg, rgba(255,255,255,0.018), rgba(255,255,255,0.008));
         border: 1px solid var(--line-2);
-        border-radius: 20px;
-        overflow: hidden;
+        border-radius: 16px;
+        overflow: visible;
         margin-top: 0;
         box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
     }
     [data-testid="stSidebarUserContent"] [data-testid="stExpander"] summary {
-        padding-top: 6px;
-        padding-bottom: 6px;
+        min-height: 44px;
+        padding-top: 4px;
+        padding-bottom: 4px;
     }
     [data-testid="stSidebarUserContent"] [data-testid="stExpander"] summary:hover {
         background: rgba(255,255,255,0.018);
     }
     [data-testid="stSidebarUserContent"] [data-testid="stExpander"] summary p {
-        font-size: 16px !important;
+        font-size: 13px !important;
         font-weight: 600 !important;
         color: var(--text-1) !important;
-        letter-spacing: 0.2px !important;
+        letter-spacing: 0 !important;
+        white-space: nowrap !important;
     }
     [data-testid="stSidebarUserContent"] [data-testid="stExpander"] details[open] summary {
         border-bottom: 1px solid rgba(255,255,255,0.05);
-        margin-bottom: 10px;
+        margin-bottom: 6px;
+    }
+    [data-testid="stSidebarUserContent"] [data-testid="stExpander"] details > div {
+        padding: 8px 16px 10px !important;
     }
     [data-testid="stFileUploaderDropzone"] {
         position: relative;
         min-height: auto;
-        padding: 0 0 26px 0 !important;
+        padding: 2px 0 30px 0 !important;
         display: flex;
-        align-items: stretch;
+        align-items: center;
         justify-content: center;
         background: transparent !important;
         border: none !important;
+        margin-bottom: 10px;
     }
     [data-testid="stFileUploaderDropzone"] section,
     [data-testid="stFileUploaderDropzone"] small,
-    [data-testid="stFileUploaderDropzone"] span,
-    [data-testid="stFileUploaderDropzone"] p {
+    [data-testid="stFileUploaderDropzone"] > div > div > *:not(button) {
         display: none !important;
     }
     [data-testid="stFileUploaderDropzone"]::after {
@@ -1363,9 +1542,10 @@ st.markdown("""
         position: absolute;
         left: 50%;
         transform: translateX(-50%);
-        bottom: 2px;
+        bottom: 4px;
         color: var(--text-2);
         font-size: 12px;
+        line-height: 1.2;
         pointer-events: none;
         z-index: 1;
         white-space: nowrap;
@@ -1374,15 +1554,17 @@ st.markdown("""
         width: 100%;
         display: flex;
         justify-content: center;
-        align-items: stretch;
+        align-items: center;
     }
     [data-testid="stFileUploaderDropzone"] button {
         font-size: 0 !important;
         position: relative;
-        margin-top: 0 !important;
-        min-height: 52px !important;
-        width: 100% !important;
-        padding: 0 20px !important;
+        margin: 0 auto !important;
+        min-height: 42px !important;
+        width: auto !important;
+        min-width: 168px !important;
+        max-width: 100% !important;
+        padding: 0 24px !important;
         border-radius: 14px !important;
         border: 1px solid rgba(0, 242, 234, 0.24) !important;
         background: linear-gradient(180deg, rgba(0, 242, 234, 0.12), rgba(0, 242, 234, 0.05)) !important;
@@ -1396,12 +1578,15 @@ st.markdown("""
         border-color: rgba(0, 242, 234, 0.55) !important;
         background: linear-gradient(180deg, rgba(0, 242, 234, 0.16), rgba(0, 242, 234, 0.06)) !important;
     }
-    [data-testid="stFileUploaderDropzone"] button::after {
-        content: "选择文件";
-        font-size: 16px;
+    [data-testid="stFileUploaderDropzone"] button * {
+        font-size: 0 !important;
+    }
+    [data-testid="stFileUploaderDropzone"] button::before {
+        content: "选择 PDF 文件";
+        font-size: 13px;
         color: var(--text-1);
         font-weight: 600;
-        letter-spacing: 0.4px;
+        letter-spacing: 0;
     }
     [data-testid="stSidebarUserContent"] .nav-pill-row {
         margin: 0 0 14px;
@@ -1444,31 +1629,7 @@ st.markdown("""
 # 4. 侧边栏逻辑
 # ===========================
 with st.sidebar:
-    title_col, refresh_col = st.columns([0.8, 0.2])
-    with title_col:
-        st.markdown('<div class="sidebar-title">FUND.OS</div>', unsafe_allow_html=True)
-    with refresh_col:
-        st.markdown(
-            """<style>div[data-testid="stVerticalBlock"] button[key="sidebar_refresh"] {
-                border: 1px solid var(--line-2) !important;
-                border-radius: 999px !important;
-                min-height: 40px !important;
-                margin-top: 0 !important;
-                color: var(--accent) !important;
-                background: rgba(255,255,255,0.02) !important;
-                font-size: 18px !important;
-                line-height: 1 !important;
-                padding: 0 !important;
-            }
-            div[data-testid="stVerticalBlock"] button[key="sidebar_refresh"]:hover {
-                border-color: var(--accent) !important;
-                background: var(--accent-soft) !important;
-            }</style>""",
-            unsafe_allow_html=True
-        )
-        if st.button("↻", key="sidebar_refresh", help="刷新缓存并重新加载数据", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    st.markdown('<div class="sidebar-title">FUND.OS</div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
     if 'nav_mode' not in st.session_state: st.session_state.nav_mode = "OVERVIEW"
     trade_dates_desc = get_trade_dates(TRANS_HISTORY, descending=True)
@@ -1480,82 +1641,47 @@ with st.sidebar:
         st.session_state.upload_sync_feedback = None
 
     st.markdown('<div class="sidebar-section-label">导航</div>', unsafe_allow_html=True)
-    tab_c1, tab_c2, tab_c3 = st.columns(3)
-    
-    def render_tab_btn(col, label, mode):
-        active = st.session_state.nav_mode == mode
-        btn_key = f"nav_{mode}"
-        active_bg = "linear-gradient(180deg, rgba(0, 242, 234, 0.14), rgba(0, 242, 234, 0.04))" if active else "rgba(255,255,255,0.02)"
-        active_border = "rgba(0, 242, 234, 0.32)" if active else "var(--line-1)"
-        active_color = "var(--text-1)" if active else "var(--text-2)"
-        css = f"""<style>
-        div[data-testid="stVerticalBlock"] button[key="{btn_key}"] {{
-            min-height: 48px !important;
-            border-radius: 14px !important;
-            border: 1px solid {active_border} !important;
-            background: {active_bg} !important;
-            color: {active_color} !important;
-            font-weight: {600 if active else 500} !important;
-            letter-spacing: 0.2px !important;
-            box-shadow: {("inset 0 1px 0 rgba(255,255,255,0.05), 0 0 0 1px rgba(0,242,234,0.04)" if active else "none")} !important;
-        }}
-        div[data-testid="stVerticalBlock"] button[key="{btn_key}"]:hover {{
-            border-color: rgba(0, 242, 234, 0.36) !important;
-            color: var(--text-1) !important;
-            background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.018)) !important;
-        }}
-        </style>"""
-        st.markdown(css, unsafe_allow_html=True)
-        if col.button(label, key=btn_key, use_container_width=True):
-            st.session_state.nav_mode = mode
-            st.rerun()
-            
-    render_tab_btn(tab_c1, "总览", "OVERVIEW")
-    render_tab_btn(tab_c2, "复盘", "REVIEW")
-    render_tab_btn(tab_c3, "详情", "DETAILS")
+    nav_options = ["OVERVIEW", "REVIEW", "DETAILS"]
+    nav_labels = {"OVERVIEW": "总览", "REVIEW": "复盘", "DETAILS": "详情"}
+    nav_value = st.segmented_control(
+        "导航",
+        nav_options,
+        default=st.session_state.nav_mode,
+        format_func=lambda value: nav_labels[value],
+        key="nav_segmented_control",
+        label_visibility="collapsed",
+        width="stretch",
+    )
+    if nav_value and nav_value != st.session_state.nav_mode:
+        st.session_state.nav_mode = nav_value
+        st.rerun()
 
     st.markdown('<div class="sidebar-section-label">数据同步</div>', unsafe_allow_html=True)
+    if st.button("刷新数据", key="sidebar_refresh", help="清除缓存并重新拉取行情、估值和持仓计算", icon=":material/refresh:", type="primary", width="stretch"):
+        st.cache_data.clear()
+        st.rerun()
+
     with st.expander("上传交易记录 PDF", expanded=False):
         uploaded_pdf = st.file_uploader(
-            "选择交易 PDF",
+            "PDF 文件",
             type=["pdf"],
             key="trade_pdf_uploader",
-            help="支持最近一周、最近一月或完整交易明细 PDF。默认按增量去重导入。"
+            help="支持最近一周、最近一月或完整交易明细 PDF。默认按增量去重导入。",
+            label_visibility="collapsed",
         )
-        snapshot_mode = st.toggle(
-            "快照覆盖旧记录",
+        snapshot_mode = st.checkbox(
+            "覆盖旧 PDF 记录",
             value=False,
             help="关闭时按增量追加去重；开启时用这份 PDF 替换同账户旧的 PDF 记录。"
         )
-        st.markdown(
-            """<style>
-            div[data-testid="stVerticalBlock"] button[key="sync_trades_btn"] {
-                min-height: 44px !important;
-                border-radius: 14px !important;
-                border: 1px solid rgba(0, 242, 234, 0.24) !important;
-                background: linear-gradient(180deg, rgba(0, 242, 234, 0.14), rgba(0, 242, 234, 0.06)) !important;
-                color: var(--text-1) !important;
-                font-weight: 600 !important;
-                box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 0 0 1px rgba(0,242,234,0.04) !important;
-            }
-            div[data-testid="stVerticalBlock"] button[key="sync_trades_btn"]:hover {
-                border-color: rgba(0, 242, 234, 0.44) !important;
-                background: linear-gradient(180deg, rgba(0, 242, 234, 0.18), rgba(0, 242, 234, 0.07)) !important;
-            }
-            </style>""",
-            unsafe_allow_html=True
-        )
-        if st.button("同步交易记录", key="sync_trades_btn", use_container_width=True):
-            if not uploaded_pdf:
-                st.warning("先选择一份 PDF 再同步。")
-            else:
-                try:
-                    result = sync_uploaded_pdf(uploaded_pdf, snapshot=snapshot_mode)
-                    st.session_state.upload_sync_feedback = result
-                    st.cache_data.clear()
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"同步失败：{exc}")
+        if uploaded_pdf and st.button("同步交易记录", key="sync_trades_btn", icon=":material/sync:", type="primary", width="stretch"):
+            try:
+                result = sync_uploaded_pdf(uploaded_pdf, snapshot=snapshot_mode)
+                st.session_state.upload_sync_feedback = result
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"同步失败：{exc}")
 
         if st.session_state.upload_sync_feedback:
             feedback = st.session_state.upload_sync_feedback
@@ -1708,6 +1834,40 @@ if st.session_state.nav_mode == "OVERVIEW":
         st.dataframe(
             allocation_df.style.format(
                 {
+                    "持仓市值": "¥{:.2f}",
+                    "盈亏": "¥{:+.2f}",
+                }
+            ).map(style_pnl, subset=["盈亏"]),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        holding_rows = []
+        for category, funds in MY_PORTFOLIO.items():
+            for fund in funds:
+                suffix = f" ({fund[1]})"
+                display_name = fund[0][:-len(suffix)] if fund[0].endswith(suffix) else fund[0]
+                holding_rows.append({
+                    "基金": display_name,
+                    "代码": fund[1],
+                    "分类": get_category_label(category),
+                    "份额": fund[6],
+                    "持仓本金": fund[7],
+                    "持仓市值": fund[3],
+                    "盈亏": fund[4],
+                })
+
+        render_section_header(
+            "明细",
+            "持仓明细",
+            ""
+        )
+        holding_df = pd.DataFrame(holding_rows).sort_values("持仓市值", ascending=False)
+        st.dataframe(
+            holding_df.style.format(
+                {
+                    "份额": "{:.2f}",
+                    "持仓本金": "¥{:.2f}",
                     "持仓市值": "¥{:.2f}",
                     "盈亏": "¥{:+.2f}",
                 }
