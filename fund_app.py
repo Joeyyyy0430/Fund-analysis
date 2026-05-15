@@ -10,7 +10,13 @@ import tempfile
 import time
 
 from import_pdf_to_csv import load_pdf_snapshot
-from trade_ledger import fetch_transactions, get_db_path, replace_source_transactions, upsert_source_transactions
+from trade_ledger import (
+    enrich_transactions_with_fee_logic,
+    fetch_transactions,
+    get_db_path,
+    replace_source_transactions,
+    upsert_source_transactions,
+)
 
 # --- 页面配置 ---
 st.set_page_config(page_title="FundOS", layout="wide", initial_sidebar_state="expanded")
@@ -91,14 +97,30 @@ TERM_TIPS = {
     "穿透估算": "根据基金披露持仓和成分涨跌做出的估算结果，用来交叉验证官方估值。",
     "单位净值": "基金每一份额对应的净资产价值，通常按交易日披露。",
     "盘中估算净值": "根据最新净值和盘中估值涨跌幅推算的实时参考净值。",
+    "成本价": "当前仍持有仓位的平均成本净值，等于持仓本金除以持有份额。",
     "持仓分布": "按当前仍持有的基金分类汇总，帮助你看清仓位集中在哪些主题。",
     "归因拆解": "把基金估值拆到持仓成分和剩余仓位，观察哪些部分在驱动当日表现。",
+}
+
+SPECIAL_POSITION_RULES = {
+    # Gold-linked redemptions often stay visible in the broker holding page for an
+    # extra settlement day, so keep them in displayed holdings slightly longer.
+    "004253": {"sell_settlement_lag_days": 1},
+}
+
+SPECIAL_VALUATION_RULES = {
+    # QDII linked funds track the A-share estimate more closely than the raw C-share
+    # fundgz feed in the broker app.
+    "006479": {"prefer_shadow_code_estimate": True},
+    # Pending gold redemptions stay displayed closer to the previous confirmed NAV.
+    "004253": {"prefer_previous_nav_when_pending_sell": True},
 }
 
 def load_transactions():
     """Load transactions from the SQLite ledger."""
     try:
-        return fetch_transactions(DB_FILE, csv_path=TX_FILE)
+        rows = fetch_transactions(DB_FILE, csv_path=TX_FILE)
+        return enrich_transactions_with_fee_logic(rows)
     except Exception as e:
         st.error(f"Error loading transactions: {e}")
         return []
@@ -140,49 +162,93 @@ def resolve_fund_meta(code, name_lookup):
     category, bench = infer_fund_group(display_name)
     return {"name": display_name, "category": category, "bench": bench}
 
-def get_portfolio_from_transactions(transactions):
-    """Calculate current holdings from transaction history."""
-    portfolio = {} # {code: {shares: float, cost: float, realized_pl: float}}
-    
-    # Init from Metadata to ensure we have categories
-    # Structure: "CATEGORY": [ (Name(Code), Code, Bench, MarketValue, Profit, Beta) ]
-    
-    holdings = {}
-    
+def tx_sort_key(tx):
+    return (
+        tx.get('date', ''),
+        tx.get('trade_time') or tx.get('date', ''),
+        tx.get('external_id', ''),
+    )
+
+
+def parse_tx_date(value):
+    try:
+        return datetime.strptime(str(value), '%Y-%m-%d').date()
+    except Exception:
+        return None
+
+
+def get_display_share_adjustment(transactions, code, reference_date=None):
+    if reference_date is None:
+        reference_date = datetime.today().strftime('%Y-%m-%d')
+    reference_day = parse_tx_date(reference_date)
+    if reference_day is None:
+        return 0.0
+
+    lag_days = SPECIAL_POSITION_RULES.get(code, {}).get('sell_settlement_lag_days', 0)
+    if not lag_days:
+        return 0.0
+
+    adjustment = 0.0
     for tx in transactions:
+        if tx.get('code') != code or tx.get('type') != 'SELL':
+            continue
+        tx_day = parse_tx_date(tx.get('date'))
+        if tx_day is None:
+            continue
+        day_delta = (reference_day - tx_day).days
+        if 1 <= day_delta <= lag_days:
+            try:
+                adjustment += float(tx.get('shares') or 0)
+            except Exception:
+                continue
+    return adjustment
+
+
+def get_portfolio_from_transactions(
+    transactions,
+    include_same_day_buys=True,
+    include_same_day_sells=False,
+    reference_date=None,
+):
+    """Calculate holdings using the selected broker-style inclusion rules."""
+    holdings = {}
+    if reference_date is None:
+        reference_date = datetime.today().strftime('%Y-%m-%d')
+    reference_day = parse_tx_date(reference_date)
+
+    for tx in sorted(transactions, key=tx_sort_key):
+        tx_date = tx.get('date')
+        if tx_date and tx_date > reference_date:
+            continue
+        if tx_date == reference_date:
+            if tx['type'] == 'BUY' and not include_same_day_buys:
+                continue
+            if tx['type'] == 'SELL' and not include_same_day_sells:
+                continue
+
         code = tx['code']
         if code not in holdings:
             holdings[code] = {'shares': 0.0, 'total_cost': 0.0, 'realized': 0.0}
-            
-        t_type = tx['type']
+
         try:
             shares = float(tx['shares'])
-            amount = float(tx['amount']) # For BUY, this is cost. For SELL, this is redemption amount.
-        except:
+            amount = float(tx['amount'])
+            fee = float(tx.get('effective_fee', tx.get('fee') or 0))
+        except Exception:
             continue
-            
-        if t_type == 'BUY':
+
+        if tx['type'] == 'BUY':
             holdings[code]['shares'] += shares
-            holdings[code]['total_cost'] += amount
-        elif t_type == 'SELL':
-            # FIFO avg cost is simple adoption here: reduce cost proportionally
-            if holdings[code]['shares'] > 0:
-                avg_cost = holdings[code]['total_cost'] / holdings[code]['shares']
-                cost_part = shares * avg_cost
-                pnl = amount - cost_part
-                
-                holdings[code]['shares'] -= shares
-                holdings[code]['total_cost'] -= cost_part
-                holdings[code]['realized'] += pnl
-    
-    # Rebuild MY_PORTFOLIO structure
-    # Returns: { "CAT": [ (Name, Code, Bench, MktVal, Profit/Loss(Total), Beta) ] }
-    structured_portfolio = {}
-    
-    # 1. Update prices for market value calc
-    # We need current NAV to calc MarketValue. We'll use a cache or fetch in real-time loop later.
-    # For now, we return the raw holdings and let the main loop fill in Market Value.
-    
+            holdings[code]['total_cost'] += amount + fee
+        elif holdings[code]['shares'] > 0:
+            avg_cost = holdings[code]['total_cost'] / holdings[code]['shares']
+            cost_part = shares * avg_cost
+            pnl = amount - fee - cost_part
+
+            holdings[code]['shares'] -= shares
+            holdings[code]['total_cost'] -= cost_part
+            holdings[code]['realized'] += pnl
+
     return holdings
 
 
@@ -197,13 +263,6 @@ def calculate_today_trade_impact(transactions, valuation_map, analysis_date=None
     detail_rows = []
     realized_total, floating_total = 0.0, 0.0
 
-    def tx_sort_key(tx):
-        return (
-            tx.get('date', ''),
-            tx.get('trade_time') or tx.get('date', ''),
-            tx.get('external_id', ''),
-        )
-
     for tx in sorted(transactions, key=tx_sort_key):
         code = tx['code']
         if code not in positions:
@@ -212,7 +271,7 @@ def calculate_today_trade_impact(transactions, valuation_map, analysis_date=None
         try:
             shares = float(tx['shares'])
             amount = float(tx['amount'])
-            fee = float(tx.get('fee') or 0)
+            fee = float(tx.get('effective_fee', tx.get('fee') or 0))
         except:
             continue
 
@@ -239,7 +298,7 @@ def calculate_today_trade_impact(transactions, valuation_map, analysis_date=None
 
         if tx_type == 'BUY':
             positions[code]['shares'] += shares
-            positions[code]['cost'] += amount
+            positions[code]['cost'] += amount + fee
         elif tx_type == 'SELL':
             if positions[code]['shares'] > 0:
                 avg_cost = positions[code]['cost'] / positions[code]['shares']
@@ -460,6 +519,11 @@ def sync_uploaded_pdf(uploaded_file, snapshot=False):
 # Initial Load
 TRANS_HISTORY = load_transactions()
 HOLDINGS_STATE = get_portfolio_from_transactions(TRANS_HISTORY)
+PREVIOUS_CLOSE_STATE = get_portfolio_from_transactions(
+    TRANS_HISTORY,
+    include_same_day_buys=False,
+    include_same_day_sells=False,
+)
 FUND_NAME_LOOKUP = build_fund_name_lookup(TRANS_HISTORY)
 
 # Construct Display Portfolio
@@ -534,6 +598,14 @@ def get_real_code(code):
     """获取用于查询数据的真实代码"""
     return REAL_CODE_MAP.get(code, code)
 
+
+def get_valuation_codes(code):
+    primary = str(code or "").strip()
+    mapped = get_real_code(primary)
+    if mapped and mapped != primary:
+        return [primary, mapped]
+    return [primary]
+
 def get_realtime_quote_sina(symbol):
     if not (symbol.startswith('sh') or symbol.startswith('sz') or symbol.startswith('bj')):
         if symbol.startswith('6') or symbol.startswith('5'): symbol = f"sh{symbol}"
@@ -556,37 +628,87 @@ def get_realtime_quote_sina(symbol):
     return None
 
 def get_official_valuation_universal(code):
-    # 1. 映射真实代码
-    search_code = get_real_code(code)
-    
-    # 2. 股票/ETF
+    valuation_codes = get_valuation_codes(code)
+    search_code = valuation_codes[0]
+
+    # 1. 股票/ETF
     if search_code.startswith('sz') or search_code.startswith('sh'):
         q = get_realtime_quote_sina(search_code)
-        if q: return {"est_rate": q['rate'], "time": q['time'], "type": "ETF/STOCK"}
+        if q:
+            return {
+                "est_rate": q['rate'],
+                "time": q['time'],
+                "type": "ETF/STOCK",
+                "price": float(q.get('price') or 0),
+                "dwjz": float(q.get('price') or 0),
+                "gsz": float(q.get('price') or 0),
+            }
         return None
 
-    # 3. 基金接口
-    url = f"http://fundgz.1234567.com.cn/js/{search_code}.js"
-    try:
-        response = requests.get(url, timeout=1)
-        if response.status_code == 200:
-            text = response.text.strip()
-            if text.startswith("jsonpgz(") and text.endswith(");"):
-                json_str = text[len("jsonpgz("):-2].strip()
-                if json_str:
-                    import json
-                    data = json.loads(json_str)
-                    time_raw = data.get('gztime', '')
-                    time_clean = time_raw.split(' ')[-1] if ' ' in time_raw else time_raw
-                    return {"est_rate": float(data['gszzl']), "time": time_clean, "type": "FUND"}
-    except:
-        pass
+    # 2. 基金接口，优先使用原始份额代码，只有拿不到时才回退到映射代码。
+    for candidate in valuation_codes:
+        url = f"http://fundgz.1234567.com.cn/js/{candidate}.js"
+        try:
+            response = requests.get(url, timeout=1)
+            if response.status_code == 200:
+                text = response.text.strip()
+                if text.startswith("jsonpgz(") and text.endswith(");"):
+                    json_str = text[len("jsonpgz("):-2].strip()
+                    if json_str:
+                        import json
+                        data = json.loads(json_str)
+                        time_raw = data.get('gztime', '')
+                        time_clean = time_raw.split(' ')[-1] if ' ' in time_raw else time_raw
+                        return {
+                            "est_rate": float(data['gszzl']),
+                            "time": time_clean,
+                            "type": "FUND",
+                            "code": candidate,
+                            "jzrq": data.get('jzrq'),
+                            "dwjz": float(data['dwjz']) if data.get('dwjz') else None,
+                            "gsz": float(data['gsz']) if data.get('gsz') else None,
+                        }
+        except:
+            pass
     
-    # 4. 兜底
+    # 3. 兜底
     q = get_realtime_quote_sina(search_code)
-    if q: return {"est_rate": q['rate'], "time": q['time'], "type": "ETF/LOF"}
+    if q:
+        return {
+            "est_rate": q['rate'],
+            "time": q['time'],
+            "type": "ETF/LOF",
+            "price": float(q.get('price') or 0),
+            "dwjz": float(q.get('price') or 0),
+            "gsz": float(q.get('price') or 0),
+        }
     
     return {"est_rate": None, "time": "NO_FEED", "type": "UNAVAILABLE"}
+
+
+def get_display_nav(code, category, valuation_data, last_nav, today_str):
+    special_rule = SPECIAL_VALUATION_RULES.get(code, {})
+    if special_rule.get("prefer_shadow_code_estimate"):
+        shadow_code = get_real_code(code)
+        if shadow_code and shadow_code != code:
+            shadow_data = get_official_valuation_universal(shadow_code)
+            if shadow_data:
+                if shadow_data.get('gsz') is not None:
+                    return float(shadow_data['gsz'])
+                if shadow_data.get('dwjz') is not None:
+                    return float(shadow_data['dwjz'])
+
+    if valuation_data:
+        if valuation_data.get('type') in {'ETF/STOCK', 'ETF/LOF'} and valuation_data.get('price'):
+            return float(valuation_data['price'])
+
+        if category == "GLOBAL" and valuation_data.get('gsz') is not None and valuation_data.get('jzrq') != today_str:
+            return float(valuation_data['gsz'])
+
+        if valuation_data.get('dwjz') is not None:
+            return float(valuation_data['dwjz'])
+
+    return float(last_nav or 0)
 
 @st.cache_data(ttl=3600)
 def get_fund_holdings(fund_code):
@@ -808,7 +930,7 @@ def calculate_indicators(df):
     return df
 
 # --- 赛博图表渲染 (增强版: 交易点 + 百分比显示) ---
-def render_cyber_chart(df, transactions=None, display_days=None, intraday_est_rate=None):
+def render_cyber_chart(df, transactions=None, display_days=None, intraday_est_rate=None, average_cost=None):
     if transactions is None:
         transactions = []
 
@@ -845,22 +967,29 @@ def render_cyber_chart(df, transactions=None, display_days=None, intraday_est_ra
     # Display current NAV info
     current_nav = df.iloc[-1]['value']
     estimated_nav = current_nav * (1 + intraday_est_rate / 100) if intraday_est_rate is not None else None
-    
 
-    
     # Calculate total return since inception (or relative to 1.0)
     total_return = ((current_nav - base_value) / base_value) * 100
-    
     pct_color = '#34c759' if total_return >= 0 else '#ff3b30'
+
+    avg_cost_value = None
+    cost_delta = None
+    if average_cost is not None:
+        try:
+            avg_cost_value = float(average_cost)
+        except:
+            avg_cost_value = None
+    if avg_cost_value is not None and avg_cost_value > 0:
+        cost_delta = ((current_nav / avg_cost_value) - 1) * 100
+
     st.markdown(f"""
-        <div style='font-size: 12px; color: #666; margin-bottom: 8px;'>
-            {term_tip('单位净值')}: <span style='color: #00f2ea; font-weight: bold;'>{current_nav:.4f}</span> 
-            <span style='color: {pct_color}; font-weight: bold; margin-left: 8px;'>{total_return:+.2f}%</span>
-            <span style='color: #666; margin-left: 8px;'>(成立以来)</span>
-        </div>
-        <div style='font-size: 12px; color: #666; margin-bottom: 12px;'>
-            {term_tip('盘中估算净值')}:
-            <span style='color: #00f2ea; font-weight: bold;'>{f'{estimated_nav:.4f}' if estimated_nav is not None else '暂无'}</span>
+        <div style='display:flex; flex-wrap:wrap; gap:14px; align-items:center; font-size:12px; color:#666; margin:4px 0 6px;'>
+            <span>{term_tip('单位净值')}: <span style='color:#00f2ea; font-weight:bold;'>{current_nav:.4f}</span></span>
+            <span style='color:{pct_color}; font-weight:bold;'>{total_return:+.2f}%</span>
+            <span style='color:#666;'>(成立以来)</span>
+            <span>{term_tip('盘中估算净值')}: <span style='color:#00f2ea; font-weight:bold;'>{f'{estimated_nav:.4f}' if estimated_nav is not None else '暂无'}</span></span>
+            <span>{term_tip('成本价')}: <span style='color:#f5f5f5; font-weight:bold;'>{f'{avg_cost_value:.4f}' if avg_cost_value is not None and avg_cost_value > 0 else '暂无'}</span></span>
+            <span style='color:{'#ff3b30' if cost_delta is not None and cost_delta >= 0 else '#34c759' if cost_delta is not None else '#666'}; font-weight:bold;'>{f'{cost_delta:+.2f}% vs 成本' if cost_delta is not None else ''}</span>
         </div>
     """, unsafe_allow_html=True)
     
@@ -890,6 +1019,20 @@ def render_cyber_chart(df, transactions=None, display_days=None, intraday_est_ra
     # Zero Line
     zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color='#666', strokeDash=[5, 5], strokeWidth=1).encode(y='y:Q')
     main_layers.append(zero_line)
+
+    if avg_cost_value is not None and avg_cost_value > 0:
+        cost_chart_y = ((avg_cost_value - base_value) / base_value) * 100
+        cost_df = pd.DataFrame([{"y": cost_chart_y, "label": f"成本价 {avg_cost_value:.4f}"}])
+        cost_rule = alt.Chart(cost_df).mark_rule(color='#f5f5f5', strokeDash=[6, 4], strokeWidth=1.2, opacity=0.9).encode(y='y:Q')
+        cost_label = alt.Chart(cost_df).mark_text(
+            align='left',
+            dx=6,
+            dy=-6,
+            color='#f5f5f5',
+            fontSize=10
+        ).encode(y='y:Q', text='label')
+        main_layers.append(cost_rule)
+        main_layers.append(cost_label)
 
     # Grid Trading Lines (Last Buy based)
     last_buy_price = 0.0
@@ -1751,38 +1894,49 @@ if st.session_state.nav_mode == "OVERVIEW":
     )
 
     total_mkt, total_prof, total_today = 0.0, 0.0, 0.0
+    today_str = datetime.today().strftime('%Y-%m-%d')
     valuation_map = {}
     for f in all_funds:
         # f structure: [Name, Code, Bench, MktVal(0), Profit(0), Beta, Shares, Cost]
         code = f[1]
         shares = f[6]
         cost = f[7]
+        meta = resolve_fund_meta(code, FUND_NAME_LOOKUP)
+        display_shares = shares + get_display_share_adjustment(TRANS_HISTORY, code, today_str)
         
-        # Real-time Valuation
         d = get_official_valuation_universal(code)
-        
-        # If we have real-time data, calcs are:
-        # current_nav = (last_nav * (1+est_rate/100)) -- roughly. 
-        # Better: get_official returns est_rate. We need *Base NAV* (yesterday) to calc Today's Mkt Val accurately?
-        # Actually simplified: 
-        # Market Value = Shares * Current NAV (Estimated)
-        
-        # We need Yesterday's NAV to apply est_rate.
-        # Quick Hack: Use cost/shares as avg nav? No.
-        # Fetch latest NAV from history?
         last_nav = 0.0
+        prev_nav = 0.0
         hist = get_history_data(code, 5)
         if not hist.empty:
             last_nav = hist.iloc[-1]['value']
+            prev_nav = hist.iloc[-2]['value'] if len(hist) >= 2 else last_nav
             
         est_rate = 0.0
         if d and d.get('est_rate') is not None:
             est_rate = d['est_rate']
-            
-        current_nav = last_nav * (1 + est_rate/100) if last_nav > 0 else 0
-        valuation_map[code] = {"last_nav": last_nav, "current_nav": current_nav, "est_rate": est_rate}
+
+        display_nav = get_display_nav(code, meta['category'], d, last_nav, today_str)
+        if (
+            SPECIAL_VALUATION_RULES.get(code, {}).get("prefer_previous_nav_when_pending_sell")
+            and display_shares > shares
+            and prev_nav > 0
+        ):
+            display_nav = prev_nav
+        current_nav = d.get('gsz') if d and d.get('gsz') is not None else display_nav
+        overnight_shares = PREVIOUS_CLOSE_STATE.get(code, {}).get('shares', 0.0)
+        overnight_shares += get_display_share_adjustment(TRANS_HISTORY, code, today_str)
+        yesterday_profit = overnight_shares * (last_nav - prev_nav) if last_nav and prev_nav else 0.0
+        valuation_map[code] = {
+            "last_nav": last_nav,
+            "current_nav": current_nav,
+            "display_nav": display_nav,
+            "display_shares": display_shares,
+            "est_rate": est_rate,
+            "yesterday_profit": yesterday_profit,
+        }
         
-        mkt_val = shares * current_nav
+        mkt_val = display_shares * display_nav
         profit = mkt_val - cost
         
         # Update list for Display (Hack to update tuple/list in place)
@@ -1791,7 +1945,7 @@ if st.session_state.nav_mode == "OVERVIEW":
         
         total_mkt += mkt_val
         total_prof += profit
-        total_today += mkt_val * (est_rate / 100) # Appx day change
+        total_today += yesterday_profit
 
     total_cost = total_mkt - total_prof
     summary_c1, summary_c2, summary_c3, summary_c4 = st.columns(4)
@@ -2184,9 +2338,17 @@ elif st.session_state.nav_mode == "DETAILS":
     
     # --- 查找持仓 ---
     current_holding_val = 0.0
+    avg_cost_nav = None
     for f_tuple in all_funds:
         if f_tuple[1] == target_code:
             current_holding_val = f_tuple[3] # This is now dynamically calculated MktVal
+            try:
+                holding_shares = float(f_tuple[6])
+                holding_cost = float(f_tuple[7])
+                if holding_shares > 0:
+                    avg_cost_nav = holding_cost / holding_shares
+            except:
+                avg_cost_nav = None
             break
 
     c1, c2 = st.columns(2)
@@ -2254,7 +2416,8 @@ elif st.session_state.nav_mode == "DETAILS":
         df_hist_full,
         code_tx,
         display_days=target_days,
-        intraday_est_rate=off_data['est_rate'] if off_data and off_data.get('est_rate') is not None else None
+        intraday_est_rate=off_data['est_rate'] if off_data and off_data.get('est_rate') is not None else None,
+        average_cost=avg_cost_nav
     )
     st.markdown("<div class='field-note'>短周期更适合看节奏，长周期更适合看仓位是否仍处在你能接受的大趋势里。</div>", unsafe_allow_html=True)
 
